@@ -14,7 +14,7 @@ Every component — the interpolant, the training objective, the MLP, the manual
 | Training path | curved, defined by a noise schedule | **straight line** between noise and data |
 | Sampling | reverse a ~1000-step Markov chain | integrate an ODE, 1–50 steps |
 | Loss | noise-prediction MSE | velocity-matching MSE |
-| Extra step | — | **reflow**: re-pair (noise, generated data) and retrain to straighten the paths further |
+| Extra step | none | **reflow**: re-pair (noise, generated data) and retrain to straighten the paths further |
 
 Straight paths matter because a straight-line ODE is trivial to integrate — a single Euler step is already correct along it in the population limit — so fewer function evaluations are needed at sampling time than the many small denoising steps DDPM requires.
 
@@ -69,57 +69,35 @@ python scripts/make_figures.py
 
 ## Architecture
 
-The whole pipeline is written as small, pure functions in `model.py`. Each stage below is a group of functions, called in this order:
+The whole pipeline is written as small, pure functions in `model.py` — every box below is one function, wired together exactly as the arrows show.
 
-```
- NOISE x0 ~ N(0,I)            DATA x1 (real batch)
-        │                            │
-        │        sample_uniform_time(batch, seed) → t
-        └───────────────┬────────────┘
-                         ▼
-              interpolate_linear(x0, x1, t)  →  xt
-              target_velocity(x0, x1)        →  v_star
-                         │
-                         ▼
-        make_flow_batch(x1, seed)  →  (xt, v_star, t)
-                         │
-                         ▼
-   sinusoidal_time_embedding(t)  →  concat(xt, t_emb)
-                         │
-                         ▼
-        velocity_mlp_forward(xt, t, params)
-        Linear → ReLU → Linear → ReLU → Linear
-                         │
-                         ▼
-                     v_pred
-                         │
-                         ▼
-      flow_matching_loss(v_pred, v_star)  →  MSE loss
-                         │
-                         ▼
-   flow_train_step: backward() + manual SGD, in place
-                         │
-           (repeat for n_steps) → train_rectified_flow
-                         │
-                         ▼
-              trained params (the velocity field)
-                         │
-          ┌──────────────┴───────────────┐
-          ▼                               ▼
-  euler_sample(x0, params)        heun_sample(x0, params)
-  linspace_timesteps + euler_step  linspace_timesteps + heun_step
-          │                               │
-          └──────────────┬───────────────┘
-                         ▼
-              generated samples (t = 1)
-                         │
-                         ▼
-        sample_quality_mse(samples, data)  →  eval score
-                         │
-                         ▼
-   make_reflow_pairs(noise, params)  →  (x0, generated x1)
-                         │
-                         └──── retrain on these pairs ────► straighter ODE paths
+```mermaid
+flowchart TB
+    A1[sample_gaussian_noise] --> A3[interpolate_linear]
+    A2[sample_uniform_time] --> A3
+    A2 --> A4[target_velocity]
+    A1 --> A4
+    A3 --> A5[make_flow_batch]
+    A4 --> A5
+
+    A5 --> B1[sinusoidal_time_embedding]
+    B1 --> B2[velocity_mlp_forward]
+    A5 --> B3[flow_matching_loss]
+    B2 --> B3
+
+    B3 --> C1[flow_train_step]
+    C1 --> C2[train_rectified_flow]
+
+    C2 --> D1[linspace_timesteps]
+    D1 --> D2[euler_step]
+    D2 --> D3[euler_sample]
+    D1 --> D4[heun_step]
+    D4 --> D5[heun_sample]
+
+    D3 --> E1[sample_quality_mse]
+    D5 --> E1
+    D3 --> E2[make_reflow_pairs]
+    E2 -. retrain, straighter paths .-> C2
 ```
 
 ### File map
@@ -160,39 +138,6 @@ L(θ) = E‖ v_θ(x_t, t) − (x1 − x0) ‖²
 - **Heun** — a predictor-corrector step that evaluates the velocity at both ends of the interval and averages, giving 2nd-order accuracy at roughly double the cost per step (but far fewer steps needed overall, as the benchmark above shows)
 
 **5. Reflow.** `make_reflow_pairs` runs the current model forward from noise to get `(x0, x̂1)` pairs — instead of the arbitrary random pairing used in the first training pass, the model is now paired with *its own* generated output. Retraining on these self-generated pairs is the namesake "rectification" step: it straightens the ODE trajectories further, which is what lets `InstaFlow`-style models sample in a single step.
-
-## Quickstart
-
-```bash
-git clone https://github.com/<your-username>/rectified-flow-from-scratch.git
-cd rectified-flow-from-scratch
-pip install -r requirements.txt
-
-python scaffold.py                # end-to-end demo: train + sample + reflow
-python scripts/make_figures.py    # regenerate every plot in this README
-pytest -q                         # 12 tests covering every function in model.py
-```
-
-Minimal usage:
-
-```python
-from model import (
-    make_mixture_dataset, init_velocity_mlp, train_rectified_flow,
-    sample_gaussian_noise, euler_sample,
-)
-import torch
-
-centers = torch.tensor([[-2.5, 0.0], [2.5, 0.0]])
-data = make_mixture_dataset(centers, n_per_component=48, std=0.4, seed=0)
-
-params = init_velocity_mlp(in_dim=2, hidden_dim=64, time_embed_dim=16, seed=1)
-params, loss_history = train_rectified_flow(
-    params, data, n_steps=800, batch_size=32, lr=0.05, time_embed_dim=16, seed=2
-)
-
-noise = sample_gaussian_noise(data, seed=3)
-samples = euler_sample(noise, params, n_steps=30, time_embed_dim=16)
-```
 
 ## Tests
 
