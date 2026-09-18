@@ -1,6 +1,6 @@
 # Rectified Flow from Scratch
 
-A from-scratch, pure-PyTorch implementation of **rectified flow / linear-interpolant flow matching** — the straight-path generative model that displaced DDPM-style diffusion in a lot of recent generative work (Stable Diffusion 3, InstaFlow, and friends all build on this idea).
+A from-scratch, pure-PyTorch implementation of **rectified flow / linear-interpolant flow matching** — the straight-path generative model that displaced DDPM-style diffusion in a lot of recent generative work (Stable Diffusion 3 and InstaFlow both build on this idea).
 
 Instead of learning to reverse a long, discrete Markov noising chain, this model learns a single **velocity field** that carries a Gaussian noise sample to a data sample along a straight line, and then generates by numerically integrating that velocity as an ODE. No noise-prediction network, no thousand-step Markov chain, no variance schedule — just a regression target and an ODE solver.
 
@@ -69,64 +69,57 @@ python scripts/make_figures.py
 
 ## Architecture
 
-The whole pipeline is written as small, pure functions in `model.py` — each box below is one function, wired together exactly as the arrows show. No hidden state, no framework-managed training loop.
+The whole pipeline is written as small, pure functions in `model.py`. Each stage below is a group of functions, called in this order:
 
-```mermaid
-flowchart TB
-    subgraph interp["1 · Straight-Path Interpolant"]
-        direction LR
-        A1[sample_gaussian_noise] --> A3[interpolate_linear]
-        A2[sample_uniform_time] --> A3
-        A4[data batch x1] --> A3
-        A2 --> A5[target_velocity]
-        A1 --> A5
-        A4 --> A5
-    end
-
-    subgraph obj["2 · Flow-Matching Objective"]
-        direction LR
-        B1[make_flow_batch] --> B2["xt, t"]
-        B1 --> B3[v_star]
-        B2 --> B4[velocity_mlp_forward]
-        B4 --> B5[v_pred]
-        B5 --> B6[flow_matching_loss]
-        B3 --> B6
-    end
-
-    subgraph net["3 · Velocity MLP"]
-        direction LR
-        C1[sinusoidal_time_embedding] --> C2["concat(x, t_emb)"]
-        C2 --> C3["Linear -> ReLU"]
-        C3 --> C4["Linear -> ReLU"]
-        C4 --> C5["Linear -> velocity"]
-    end
-
-    subgraph train["4 · Training Loop"]
-        direction LR
-        D1[make_mixture_dataset] --> D2[flow_train_step]
-        D2 -->|manual SGD, in place| D2
-        D2 --> D3[train_rectified_flow]
-    end
-
-    subgraph ode["5 · ODE Samplers"]
-        direction LR
-        E1[linspace_timesteps] --> E2[euler_step]
-        E2 --> E3[euler_sample]
-        E1 --> E4[heun_step]
-        E4 --> E5[heun_sample]
-    end
-
-    subgraph eval["6 · Evaluation & Reflow"]
-        direction LR
-        F1[sample_quality_mse]
-        F2[make_reflow_pairs] --> F3["(noise, generated data) pairs"]
-        F3 -.->|train again, straighter paths| D3
-    end
-
-    interp --> obj --> net
-    net --> train
-    train --> ode
-    ode --> eval
+```
+ NOISE x0 ~ N(0,I)            DATA x1 (real batch)
+        │                            │
+        │        sample_uniform_time(batch, seed) → t
+        └───────────────┬────────────┘
+                         ▼
+              interpolate_linear(x0, x1, t)  →  xt
+              target_velocity(x0, x1)        →  v_star
+                         │
+                         ▼
+        make_flow_batch(x1, seed)  →  (xt, v_star, t)
+                         │
+                         ▼
+   sinusoidal_time_embedding(t)  →  concat(xt, t_emb)
+                         │
+                         ▼
+        velocity_mlp_forward(xt, t, params)
+        Linear → ReLU → Linear → ReLU → Linear
+                         │
+                         ▼
+                     v_pred
+                         │
+                         ▼
+      flow_matching_loss(v_pred, v_star)  →  MSE loss
+                         │
+                         ▼
+   flow_train_step: backward() + manual SGD, in place
+                         │
+           (repeat for n_steps) → train_rectified_flow
+                         │
+                         ▼
+              trained params (the velocity field)
+                         │
+          ┌──────────────┴───────────────┐
+          ▼                               ▼
+  euler_sample(x0, params)        heun_sample(x0, params)
+  linspace_timesteps + euler_step  linspace_timesteps + heun_step
+          │                               │
+          └──────────────┬───────────────┘
+                         ▼
+              generated samples (t = 1)
+                         │
+                         ▼
+        sample_quality_mse(samples, data)  →  eval score
+                         │
+                         ▼
+   make_reflow_pairs(noise, params)  →  (x0, generated x1)
+                         │
+                         └──── retrain on these pairs ────► straighter ODE paths
 ```
 
 ### File map
@@ -208,9 +201,3 @@ pytest -q
 ```
 
 12 tests exercise every function in `model.py` in isolation — interpolant endpoints, batch shapes, loss values, gradient flow through the MLP, Euler/Heun correctness against a hand-computed constant field, and the end-to-end capstone experiment (trained samples must beat the noise baseline).
-
-## References
-
-- Liu, Gong, Liu — *Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow* (2022)
-- Lipman et al. — *Flow Matching for Generative Modeling* (2022)
-- Liu et al. — *InstaFlow: One Step is Enough for High-Quality Diffusion-Based Text-to-Image Generation* (2023)
